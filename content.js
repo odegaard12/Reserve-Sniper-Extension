@@ -2231,28 +2231,67 @@ if (document.readyState === 'loading') {
   initializeFilter();
 }
 
-// Reinicializar en navegación SPA con debounce y guards
+// Reinicializar en navegación SPA con debounce y soporte para pushState/replaceState
 let spaNavigationTimeout = null;
-window.addEventListener('popstate', () => {
-  // Limpiar timeout anterior
+let lastKnownUrl = window.location.href;
+
+function scheduleSpaReinitialize(reason = 'spa') {
   if (spaNavigationTimeout) {
     clearTimeout(spaNavigationTimeout);
   }
-  
-  // Marcar contexto como inválido durante navegación
+
+  const currentUrl = window.location.href;
+  if (currentUrl === lastKnownUrl && reason !== 'force') {
+    return;
+  }
+
+  lastKnownUrl = currentUrl;
+
   if (window.wallapopFilter) {
     window.wallapopFilter.contextInvalidated = true;
   }
-  
-  // Reinicializar con debounce
+
   spaNavigationTimeout = setTimeout(() => {
     if (window.wallapopFilter) {
-      // Limpiar instancia anterior
       window.wallapopFilter.destroy?.();
     }
     initializeFilter();
-  }, 500);
+  }, 350);
+}
+
+const originalPushState = history.pushState;
+history.pushState = function (...args) {
+  const previousUrl = window.location.href;
+  const result = originalPushState.apply(this, args);
+  if (window.location.href !== previousUrl) {
+    scheduleSpaReinitialize('pushState');
+  }
+  return result;
+};
+
+const originalReplaceState = history.replaceState;
+history.replaceState = function (...args) {
+  const previousUrl = window.location.href;
+  const result = originalReplaceState.apply(this, args);
+  if (window.location.href !== previousUrl) {
+    scheduleSpaReinitialize('replaceState');
+  }
+  return result;
+};
+
+window.addEventListener('popstate', () => {
+  scheduleSpaReinitialize('popstate');
 });
+
+window.addEventListener('hashchange', () => {
+  scheduleSpaReinitialize('hashchange');
+});
+
+setInterval(() => {
+  if (window.location.href !== lastKnownUrl) {
+    scheduleSpaReinitialize('interval');
+  }
+}, 1000);
 
 // Funcionalidad de debug (solo para desarrollo)
 document.addEventListener('keydown', (e) => {
