@@ -16,11 +16,16 @@ class WallapopFilter {
     // Nuevas funcionalidades del injector
     this.priceAnalysis = {
       allPrices: [],
+      priceItems: [],
       averagePrice: 0,
+      medianPrice: 0,
+      activeItemCount: 0,
       isComplete: false,
       attempts: 0,
       maxAttempts: 5
     };
+    
+    this.hiddenItemKeys = new Set();
     
     this.userBlocking = {
       blockedUsers: new Set(),
@@ -57,6 +62,125 @@ class WallapopFilter {
       .rs-visible { display: block !important; }
     `;
     document.head.appendChild(style);
+  }
+
+  normalizeItemUrl(url) {
+    if (!url || typeof url !== 'string') return '';
+    try {
+      const parsed = new URL(url, window.location.origin);
+      return `${parsed.origin}${parsed.pathname}`.replace(/\/$/, '');
+    } catch (_) {
+      return String(url).split('?')[0].replace(/\/$/, '');
+    }
+  }
+
+  getItemKeyFromContainer(itemContainer, productLink = null) {
+    const explicitId = itemContainer?.dataset?.rsItemId || productLink?.dataset?.rsItemId;
+    if (explicitId) return `item:${explicitId}`;
+
+    const explicitKey = itemContainer?.dataset?.rsItemKey || productLink?.dataset?.rsItemKey;
+    if (explicitKey) return explicitKey;
+
+    const href =
+      itemContainer?.href ||
+      productLink?.href ||
+      itemContainer?.querySelector?.('a[href*="/item/"]')?.href ||
+      '';
+
+    return this.normalizeItemUrl(href);
+  }
+
+  async savePersistentState() {
+    try {
+      await chrome.storage.local.set({
+        blockedUsers: [...this.userBlocking.blockedUsers],
+        hiddenItemKeys: [...this.hiddenItemKeys]
+      });
+    } catch (error) {
+      console.warn('⚠️ No se pudo persistir estado:', error);
+    }
+  }
+
+  calculateMedian(values) {
+    if (!values.length) return 0;
+    const sorted = [...values].sort((a, b) => a - b);
+    const middle = Math.floor(sorted.length / 2);
+    return sorted.length % 2 === 0
+      ? (sorted[middle - 1] + sorted[middle]) / 2
+      : sorted[middle];
+  }
+
+  collectActivePriceItems() {
+    const priceElements = this.findPriceElements();
+    const seenContainers = new Set();
+    const items = [];
+
+    priceElements.forEach((priceElement) => {
+      const price = this.extractPrice(priceElement);
+      if (!price || price <= 0 || price > this.PRICE_MAX) return;
+
+      const itemContainer =
+        priceElement.closest('a[class*="ItemCard"]') ||
+        priceElement.closest('div[class*="ItemCard"]') ||
+        priceElement.closest('article') ||
+        priceElement.parentNode;
+
+      if (!itemContainer || seenContainers.has(itemContainer)) return;
+      seenContainers.add(itemContainer);
+
+      const itemKey = this.getItemKeyFromContainer(itemContainer);
+      const userId = itemContainer.dataset.rsUserId || '';
+
+      if (itemKey && this.hiddenItemKeys.has(itemKey)) return;
+      if (userId && this.userBlocking.blockedUsers.has(userId)) return;
+
+      items.push({
+        itemKey,
+        userId,
+        price,
+        priceElement,
+        itemContainer
+      });
+    });
+
+    return items;
+  }
+
+  recalculatePriceAnalysisFromDOM() {
+    const items = this.collectActivePriceItems();
+    const prices = items.map(item => item.price);
+
+    this.priceAnalysis.priceItems = items.map(item => ({
+      itemKey: item.itemKey,
+      userId: item.userId,
+      price: item.price
+    }));
+    this.priceAnalysis.allPrices = prices;
+    this.priceAnalysis.activeItemCount = prices.length;
+
+    if (!prices.length) {
+      this.priceAnalysis.averagePrice = 0;
+      this.priceAnalysis.medianPrice = 0;
+      this.priceAnalysis.isComplete = false;
+
+      const averagePriceDisplay = document.getElementById('wallapop-average-price-display');
+      if (averagePriceDisplay) averagePriceDisplay.remove();
+      return null;
+    }
+
+    const averagePrice = prices.reduce((sum, price) => sum + price, 0) / prices.length;
+    const medianPrice = this.calculateMedian(prices);
+
+    this.priceAnalysis.averagePrice = averagePrice;
+    this.priceAnalysis.medianPrice = medianPrice;
+    this.priceAnalysis.isComplete = true;
+    this.priceAnalysis.attempts = 0;
+
+    return {
+      count: prices.length,
+      averagePrice,
+      medianPrice
+    };
   }
 
   // Helper para obtener URLs de iconos de forma segura
@@ -304,10 +428,17 @@ class WallapopFilter {
 
   async loadSettings() {
     try {
-      const result = await chrome.storage.local.get(['filterMode', 'extensionEnabled']);
+      const result = await chrome.storage.local.get([
+        'filterMode',
+        'extensionEnabled',
+        'blockedUsers',
+        'hiddenItemKeys'
+      ]);
       this.filterMode = result.filterMode || 'all';
       this.extensionEnabled = result.extensionEnabled !== undefined ? result.extensionEnabled : true;
-      console.log(`📋 Configuración cargada - Filtro: ${this.filterMode}, Activa: ${this.extensionEnabled}`);
+      this.userBlocking.blockedUsers = new Set(result.blockedUsers || []);
+      this.hiddenItemKeys = new Set(result.hiddenItemKeys || []);
+      console.log(`📋 Configuración cargada - Filtro: ${this.filterMode}, Activa: ${this.extensionEnabled}, Usuarios bloqueados: ${this.userBlocking.blockedUsers.size}, Items ocultos: ${this.hiddenItemKeys.size}`);
       
       // Actualizar toggle en el sidebar si existe
       setTimeout(() => {
@@ -330,6 +461,8 @@ class WallapopFilter {
     } catch (error) {
       console.log('⚠️ No se pudo cargar configuración, usando valores por defecto');
       this.extensionEnabled = true;
+      this.userBlocking.blockedUsers = new Set();
+      this.hiddenItemKeys = new Set();
     }
   }
 
@@ -435,10 +568,24 @@ class WallapopFilter {
     let visibleCount = 0;
     let hiddenCount = 0;
 
-    results.forEach((productLink, index) => {
+    results.forEach((productLink) => {
       const isReserved = this.isItemReserved(productLink);
       let shouldShow = true;
-      
+
+      const card = productLink.closest('article, li, [data-testid="item-card"], .ItemCard, .item-card, [class*="ItemCard"], [class*="Card"]') || productLink;
+      const itemKey = this.getItemKeyFromContainer(card, productLink);
+      const userId = card.dataset.rsUserId || productLink.dataset.rsUserId || '';
+
+      const hiddenByPersistence =
+        (itemKey && this.hiddenItemKeys.has(itemKey)) ||
+        (userId && this.userBlocking.blockedUsers.has(userId));
+
+      if (hiddenByPersistence) {
+        card.classList.add('rs-hidden');
+        hiddenCount++;
+        return;
+      }
+
       switch (this.filterMode) {
         case 'reserved':
           shouldShow = isReserved;
@@ -451,9 +598,6 @@ class WallapopFilter {
         default: // 'all'
           shouldShow = true;
       }
-      
-      // ✅ USAR TU MÉTODO QUE FUNCIONA
-      const card = productLink.closest('article, li, [data-testid="item-card"], .ItemCard, .item-card, [class*="ItemCard"], [class*="Card"]') || productLink;
       
       if (shouldShow) {
         card.classList.remove('rs-hidden');
@@ -580,7 +724,8 @@ class WallapopFilter {
 
   // Helper para insertar indicador de precio
   insertPriceIndicator(priceElement, price) {
-    const diff = price - this.priceAnalysis.averagePrice;
+    const referencePrice = this.priceAnalysis.medianPrice || this.priceAnalysis.averagePrice || 0;
+    const diff = price - referencePrice;
     const indicator = document.createElement('span');
     indicator.className = 'wallapop-price-indicator';
 
@@ -589,7 +734,7 @@ class WallapopFilter {
     if (diff < 0) { text = `${diff.toFixed(0)}€`;  color = '#2ed573'; }
 
     indicator.textContent = text;
-    indicator.title = `Comparado con ${this.priceAnalysis.averagePrice.toFixed(2)}€`;
+    indicator.title = `Comparado con la mediana de ${referencePrice.toFixed(2)}€`;
     indicator.style.cssText = `
       background:${color} !important; color:#fff !important;
       padding:2px 6px !important; border-radius:10px !important;
@@ -606,40 +751,13 @@ class WallapopFilter {
   analyzePagePrices() {
     console.log('💰 === INICIANDO ANÁLISIS DE PRECIOS ===');
     
-    // Permitir reanálisis si hay nuevos productos (no bloquear completamente)
-    const currentPriceElements = this.findPriceElements();
-    const currentPriceCount = currentPriceElements.length;
-    
-    // Si cambia el número de precios, re-analiza siempre
-    if (this.priceAnalysis.isComplete && this.priceAnalysis.allPrices.length > 0 && 
-        currentPriceCount === this.priceAnalysis.allPrices.length) {
-      console.log('💰 Análisis de precios ya completado y mismo número de productos, saltando...');
-      return;
-    }
-    
     this.priceAnalysis.attempts++;
     console.log(`💰 Iniciando análisis de precios (intento ${this.priceAnalysis.attempts}/${this.priceAnalysis.maxAttempts})...`);
     
-    const priceElements = this.findPriceElements();
-    console.log(`💰 Elementos de precio encontrados: ${priceElements.length}`);
+    const stats = this.recalculatePriceAnalysisFromDOM();
     
-    const prices = [];
-    
-    priceElements.forEach((element, index) => {
-      const price = this.extractPrice(element);
-      if (price) {
-        prices.push(price);
-        console.log(`Precio ${index + 1}: ${price}€`);
-      }
-    });
-    
-    if (prices.length > 0) {
-      this.priceAnalysis.averagePrice = prices.reduce((sum, price) => sum + price, 0) / prices.length;
-      this.priceAnalysis.allPrices = prices;
-      this.priceAnalysis.isComplete = true;
-      this.priceAnalysis.attempts = 0;
-      
-      console.log(`📊 Análisis completado: ${prices.length} precios, promedio: ${this.priceAnalysis.averagePrice.toFixed(2)}€`);
+    if (stats && stats.count > 0) {
+      console.log(`📊 Análisis completado: ${stats.count} precios, media: ${stats.averagePrice.toFixed(2)}€, mediana: ${stats.medianPrice.toFixed(2)}€`);
       
       this.showAveragePriceDisplay();
       this.addPriceButtons();
@@ -660,13 +778,17 @@ class WallapopFilter {
     if (existingDisplay) {
       existingDisplay.remove();
     }
+
+    if (!this.priceAnalysis.activeItemCount) {
+      return;
+    }
     
     const averagePriceDisplay = document.createElement('div');
     averagePriceDisplay.id = 'wallapop-average-price-display';
     averagePriceDisplay.style.cssText = `
       background: linear-gradient(135deg, rgb(102, 126, 234) 0%, rgb(118, 75, 162) 100%);
       color: white;
-      padding: 6px 12px;
+      padding: 8px 12px;
       border-radius: 16px;
       font-size: 11px;
       font-weight: 600;
@@ -677,11 +799,16 @@ class WallapopFilter {
       bottom: 20px;
       left: 20px;
       z-index: 10000;
-      max-width: 200px;
+      max-width: 240px;
       backdrop-filter: blur(10px);
       border: 1px solid rgba(255, 255, 255, 0.2);
+      line-height: 1.45;
     `;
-    averagePriceDisplay.innerHTML = `💰 Precio promedio: <strong>${this.priceAnalysis.averagePrice.toFixed(2)}€</strong> (${this.priceAnalysis.allPrices.length} items)`;
+    averagePriceDisplay.innerHTML = `
+      💰 Media: <strong>${this.priceAnalysis.averagePrice.toFixed(2)}€</strong><br>
+      📍 Mediana: <strong>${this.priceAnalysis.medianPrice.toFixed(2)}€</strong><br>
+      📦 Muestra activa: <strong>${this.priceAnalysis.activeItemCount}</strong>
+    `;
     
     document.body.appendChild(averagePriceDisplay);
     console.log('✅ Precio promedio insertado');
@@ -729,38 +856,25 @@ class WallapopFilter {
   // Ocultar anuncio individual
   hideIndividualAd(itemContainer) {
     const priceElement = itemContainer.querySelector('strong[class*="ItemCard__price"], strong[aria-label="Item price"]');
-    let removedPrice = null;
-    
-    if (priceElement) {
-      removedPrice = this.extractPrice(priceElement);
+    const removedPrice = priceElement ? this.extractPrice(priceElement) : null;
+    const itemKey = this.getItemKeyFromContainer(itemContainer);
+
+    if (itemKey) {
+      this.hiddenItemKeys.add(itemKey);
+      this.savePersistentState();
     }
     
     itemContainer.remove();
     this.userBlocking.blockedAdsCount++;
     
-    if (removedPrice && !isNaN(removedPrice)) {
-      // Eliminar solo una ocurrencia del precio (no todas)
-      const index = this.priceAnalysis.allPrices.indexOf(removedPrice);
-      if (index > -1) {
-        this.priceAnalysis.allPrices.splice(index, 1);
-      }
-      
-      if (this.priceAnalysis.allPrices.length > 0) {
-        this.priceAnalysis.averagePrice = this.priceAnalysis.allPrices.reduce((sum, price) => sum + price, 0) / this.priceAnalysis.allPrices.length;
-        console.log(`📊 Nuevo precio promedio: ${this.priceAnalysis.averagePrice.toFixed(2)}€ (${this.priceAnalysis.allPrices.length} items restantes)`);
-        
-        this.updateAllPriceIndicators();
-        this.showAveragePriceDisplay();
-      } else {
-        const averagePriceDisplay = document.getElementById('wallapop-average-price-display');
-        if (averagePriceDisplay) {
-          averagePriceDisplay.remove();
-        }
-      }
+    const stats = this.recalculatePriceAnalysisFromDOM();
+    if (stats) {
+      this.updateAllPriceIndicators();
+      this.showAveragePriceDisplay();
     }
     
     this.updateKpiStats();
-    this.showNotification(`Anuncio individual eliminado (${removedPrice}€)`);
+    this.showNotification(`Anuncio individual eliminado (${removedPrice ?? 'sin precio'}€)`);
   }
 
   // Actualizar todos los indicadores de precio
@@ -769,6 +883,7 @@ class WallapopFilter {
     
     // Buscar todos los indicadores existentes
     const existingIndicators = document.querySelectorAll('.wallapop-price-indicator');
+    const referencePrice = this.priceAnalysis.medianPrice || this.priceAnalysis.averagePrice || 0;
     
     existingIndicators.forEach((indicator, index) => {
       // Encontrar el elemento de precio asociado
@@ -777,25 +892,21 @@ class WallapopFilter {
         const price = this.extractPrice(priceElement);
         
         if (price && price > 0 && price <= this.PRICE_MAX) {
-          const diff = price - this.priceAnalysis.averagePrice;
-          let indicatorText = '';
-          let indicatorColor = '';
+          const diff = price - referencePrice;
+          let indicatorText = '=';
+          let indicatorColor = '#ffd43b';
           
           if (diff > 0) {
             indicatorText = `+${diff.toFixed(0)}€`;
-            indicatorColor = '#ff4757'; // Rojo
+            indicatorColor = '#ff4757';
           } else if (diff < 0) {
             indicatorText = `${diff.toFixed(0)}€`;
-            indicatorColor = '#2ed573'; // Verde
-          } else {
-            indicatorText = '=';
-            indicatorColor = '#ffd43b'; // Amarillo
+            indicatorColor = '#2ed573';
           }
           
-          // Actualizar el indicador
           indicator.textContent = indicatorText;
           indicator.style.setProperty('background', indicatorColor, 'important');
-          indicator.title = `Comparado con el promedio de ${this.priceAnalysis.averagePrice.toFixed(2)}€`;
+          indicator.title = `Comparado con la mediana de ${referencePrice.toFixed(2)}€`;
           
           console.log(`   🔄 Indicador ${index + 1} actualizado: ${price}€ - ${indicatorText} (${indicatorColor})`);
         }
@@ -1121,9 +1232,15 @@ class WallapopFilter {
               console.log(`   H3 ${index + 1}:`, h3.className, h3.textContent);
             });
 
-            // Verificar si el usuario está bloqueado
-            if (this.userBlocking.blockedUsers.has(item.user_id)) {
-              console.log(`🚫 Usuario ${item.user_id} está bloqueado, saltando...`);
+            const resolvedHref = itemContainer.href || itemContainer.querySelector('a[href*="/item/"]')?.href || '';
+            itemContainer.dataset.rsUserId = item.user_id || '';
+            itemContainer.dataset.rsItemId = item.id || '';
+            itemContainer.dataset.rsItemKey = item.id ? `item:${item.id}` : (this.normalizeItemUrl(resolvedHref) || item.image_url || item.title || '');
+
+            // Verificar si el usuario está bloqueado o el item fue ocultado previamente
+            if (this.userBlocking.blockedUsers.has(item.user_id) || (itemContainer.dataset.rsItemKey && this.hiddenItemKeys.has(itemContainer.dataset.rsItemKey))) {
+              console.log(`🚫 Item persistido como oculto/bloqueado: ${item.user_id}`);
+              itemContainer.remove();
               return;
             }
             
@@ -1321,11 +1438,11 @@ class WallapopFilter {
     
     // Agregar usuario a la lista de bloqueados
     this.userBlocking.blockedUsers.add(userId);
+    this.savePersistentState();
     
     // Buscar todos los contenedores que tienen el user_id de este usuario
     const userAds = document.querySelectorAll(`.wallapop-user-id-container`);
     let removedCount = 0;
-    let removedPrices = [];
     
     userAds.forEach(container => {
       const userIdDisplay = container.querySelector('.wallapop-user-id-display');
@@ -1338,15 +1455,11 @@ class WallapopFilter {
                             container.closest('article');
         
         if (itemContainer) {
-          // Extraer el precio del anuncio antes de eliminarlo
-          const priceElement = itemContainer.querySelector('strong[class*="ItemCard__price"]');
-          if (priceElement) {
-            const price = this.extractPrice(priceElement);
-            if (price && price > 0 && price <= this.PRICE_MAX) {
-              removedPrices.push(price);
-            }
+          const itemKey = this.getItemKeyFromContainer(itemContainer);
+          if (itemKey) {
+            this.hiddenItemKeys.add(itemKey);
           }
-          
+
           // Eliminar completamente el anuncio del DOM
           itemContainer.remove();
           removedCount++;
@@ -1359,42 +1472,9 @@ class WallapopFilter {
     // Actualizar contador de anuncios bloqueados
     this.userBlocking.blockedAdsCount += removedCount;
     
-    // Recalcular precio promedio si se eliminaron precios
-    if (removedPrices.length > 0 && this.priceAnalysis.allPrices.length > 0) {
-      console.log(`💰 Recalculando precio promedio después de eliminar ${removedPrices.length} precios...`);
-      
-      // Remover los precios eliminados de allPrices
-      removedPrices.forEach(price => {
-        const index = this.priceAnalysis.allPrices.indexOf(price);
-        if (index > -1) {
-          this.priceAnalysis.allPrices.splice(index, 1);
-        }
-      });
-      
-      // Recalcular promedio
-      if (this.priceAnalysis.allPrices.length > 0) {
-        const uniquePrices = [...new Set(this.priceAnalysis.allPrices)];
-        this.priceAnalysis.averagePrice = uniquePrices.reduce((sum, price) => sum + price, 0) / uniquePrices.length;
-        
-        console.log(`📊 Nuevo precio promedio: ${this.priceAnalysis.averagePrice.toFixed(2)}€ (${this.priceAnalysis.allPrices.length} items restantes)`);
-        
-        // Actualizar el display del precio promedio
-        const averagePriceDisplay = document.querySelector('#wallapop-average-price-display');
-        if (averagePriceDisplay) {
-          averagePriceDisplay.innerHTML = `💰 Precio promedio: <strong>${this.priceAnalysis.averagePrice.toFixed(2)}€</strong> (${this.priceAnalysis.allPrices.length} items)`;
-        }
-        
-        // Recalcular y actualizar todos los indicadores de precio
-        this.updateAllPriceIndicators();
-      } else {
-        console.log('⚠️ No quedan precios para calcular promedio');
-        // Remover el display del precio promedio
-        const averagePriceDisplay = document.querySelector('#wallapop-average-price-display');
-        if (averagePriceDisplay) {
-          averagePriceDisplay.remove();
-        }
-      }
-    }
+    this.recalculatePriceAnalysisFromDOM();
+    this.showAveragePriceDisplay();
+    this.updateAllPriceIndicators();
     
     // Actualizar contador en la barra lateral
     this.updateKpiStats();
@@ -1458,11 +1538,16 @@ class WallapopFilter {
     this.userBlocking.uniqueAuthors.clear();
     this.userBlocking.blockedUsers.clear();
     this.userBlocking.blockedAdsCount = 0;
+    this.hiddenItemKeys.clear();
     this.priceAnalysis.allPrices = [];
+    this.priceAnalysis.priceItems = [];
     this.priceAnalysis.averagePrice = 0;
+    this.priceAnalysis.medianPrice = 0;
+    this.priceAnalysis.activeItemCount = 0;
     this.priceAnalysis.isComplete = false;
     this.priceAnalysis.attempts = 0;
     
+    this.savePersistentState();
     this.clearPreviousAnalysis();
     this.updateKpiStats();
     this.updateKpiDisplay();
